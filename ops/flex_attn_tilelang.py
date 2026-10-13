@@ -1352,39 +1352,259 @@ def flex_attn_tl_two_phase(
 # ---------------------------------------------------------------------------
 # Reference (torch) implementation for testing
 # ---------------------------------------------------------------------------
-def _torch_ref_flex_attn(q, k, v, window_size, chunk_size, mask_lmk, expand_to_chunk):
-    """Reference using torch.nn.attention.flex_attention with the same mask."""
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+# def _torch_ref_flex_attn(q, k, v, window_size, chunk_size, mask_lmk, expand_to_chunk):
+#     """Reference using torch.nn.attention.flex_attention with the same mask."""
+#     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
-    q_bhld = q.transpose(1, 2).contiguous()
-    k_bhld = k.transpose(1, 2).contiguous()
-    v_bhld = v.transpose(1, 2).contiguous()
-    L_q = q.shape[1]
-    L_k = k.shape[1]
-    q_offset = L_k - L_q
+#     q_bhld = q.transpose(1, 2).contiguous()
+#     k_bhld = k.transpose(1, 2).contiguous()
+#     v_bhld = v.transpose(1, 2).contiguous()
+#     L_q = q.shape[1]
+#     L_k = k.shape[1]
+#     q_offset = L_k - L_q
 
-    def mask_mod(b, h, q_idx, kv_idx):
-        real_q = q_idx + q_offset
-        if expand_to_chunk:
-            start = real_q - window_size + 1
-            chunk_start = (start // chunk_size) * chunk_size
-        else:
-            chunk_start = real_q - window_size + 1
-        keep = (kv_idx >= chunk_start) & (kv_idx <= real_q)
-        if mask_lmk:
-            keep = keep & ((kv_idx + 1) % chunk_size != 0)
-        return keep
+#     def mask_mod(b, h, q_idx, kv_idx):
+#         real_q = q_idx + q_offset
+#         if expand_to_chunk:
+#             start = real_q - window_size + 1
+#             chunk_start = (start // chunk_size) * chunk_size
+#         else:
+#             chunk_start = real_q - window_size + 1
+#         keep = (kv_idx >= chunk_start) & (kv_idx <= real_q)
+#         if mask_lmk:
+#             keep = keep & ((kv_idx + 1) % chunk_size != 0)
+#         return keep
 
-    block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=L_q, KV_LEN=L_k)
+#     block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=L_q, KV_LEN=L_k)
 
-    o, lse = flex_attention(
-        q_bhld, k_bhld, v_bhld,
-        block_mask=block_mask,
-        enable_gqa=True,
-        return_lse=True,
+#     o, lse = flex_attention(
+#         q_bhld, k_bhld, v_bhld,
+#         block_mask=block_mask,
+#         enable_gqa=True,
+#         return_lse=True,
+#     )
+#     return o, lse
+
+
+
+
+import math
+import operator
+import triton
+import triton.language as tl
+
+@triton.jit(do_not_specialize=["LQ", "LK"])
+def _triton_attention_fwd(
+    Q, K, V, O, LSE,
+    LQ, LK,
+    SQB: tl.constexpr, SQL: tl.constexpr,
+    SQH: tl.constexpr, SQD: tl.constexpr,
+    SKB: tl.constexpr, SKL: tl.constexpr,
+    SKH: tl.constexpr, SKD: tl.constexpr,
+    SVB: tl.constexpr, SVL: tl.constexpr,
+    SVH: tl.constexpr, SVD: tl.constexpr,
+    HQ: tl.constexpr, GROUP: tl.constexpr,
+    D: tl.constexpr, DV: tl.constexpr,
+    WINDOW: tl.constexpr, CHUNK: tl.constexpr,
+    MASK_LMK: tl.constexpr, EXPAND: tl.constexpr,
+    SCALE_LOG2: tl.constexpr, FP32_PRECISION: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr,
+    BD: tl.constexpr, BDV: tl.constexpr,
+):
+    # Flatten the grid to avoid CUDA's 65535 limit on grid.y.
+    query_tiles = (LQ + BM - 1) // BM
+    program = tl.program_id(0)
+    tile = program % query_tiles
+    bh = (program // query_tiles).to(tl.int64)
+    batch = bh // HQ
+    head = bh % HQ
+    kv_head = head // GROUP
+
+    # int64 pointer offsets also support large, strided KV caches.
+    rows = tile * BM + tl.arange(0, BM)
+    q_abs = rows + (LK - LQ)
+    ds = tl.arange(0, BD).to(tl.int64)
+    dvs = tl.arange(0, BDV).to(tl.int64)
+    ns = tl.arange(0, BN)
+    q = tl.load(
+        Q + batch * SQB + head * SQH
+        + rows[:, None].to(tl.int64) * SQL + ds[None, :] * SQD,
+        mask=(rows[:, None] < LQ) & (ds[None, :] < D), other=0,
     )
-    return o, lse
 
+    # All physical KV indices are >= 0. Clamping before division is
+    # equivalent to Python's negative floor division for this mask, and
+    # avoids Triton's different signed-division semantics.
+    left = tl.maximum(q_abs - WINDOW + 1, 0)
+    first_left = tl.maximum(tile * BM + (LK - LQ) - WINDOW + 1, 0)
+    if EXPAND:
+        left = (left // CHUNK) * CHUNK
+        first_left = (first_left // CHUNK) * CHUNK
+    lo = (first_left // BN) * BN
+    hi = tl.maximum(0, tl.minimum(LK, tl.minimum((tile + 1) * BM, LQ) + (LK - LQ)))
+
+    m = tl.full((BM,), -float("inf"), tl.float32)
+    z = tl.zeros((BM,), tl.float32)
+    acc = tl.zeros((BM, BDV), tl.float32)
+    k_base = K + batch * SKB + kv_head * SKH
+    v_base = V + batch * SVB + kv_head * SVH
+
+    # Only the union of these queries' local windows is visited.
+    for begin in range(lo, hi, BN):
+        cols = begin + ns
+        k = tl.load(
+            k_base + ds[:, None] * SKD
+            + cols[None, :].to(tl.int64) * SKL,
+            mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
+        )
+        scores = tl.dot(q, k, input_precision=FP32_PRECISION) * SCALE_LOG2
+        keep = ((rows[:, None] < LQ) & (cols[None, :] < LK)
+                & (cols[None, :] >= left[:, None])
+                & (cols[None, :] <= q_abs[:, None]))
+        if MASK_LMK:
+            keep = keep & ((cols[None, :] + 1) % CHUNK != 0)
+        scores = tl.where(keep, scores, -float("inf"))
+
+        new_m = tl.maximum(m, tl.max(scores, axis=1))
+        # If both old state and this tile are empty, never evaluate
+        # -inf - -inf. p=0, alpha=0, z=0, acc=0 remain well-defined.
+        safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        alpha = tl.exp2(m - safe_m)
+        p = tl.exp2(scores - safe_m[:, None])
+        z = z * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            v_base + cols[:, None].to(tl.int64) * SVL
+            + dvs[None, :] * SVD,
+            mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
+        )
+        # Tensor cores for fp16/bf16; FP32 accumulation in both dots.
+        acc = tl.dot(p.to(v.dtype), v, acc, input_precision=FP32_PRECISION)
+        m = new_m
+
+    nonempty = z > 0.0
+    safe_z = tl.where(nonempty, z, 1.0)
+    out = acc / safe_z[:, None]
+    # Internal exp2/log2 domain -> public natural-log LSE.
+    lse = tl.where(nonempty, (m + tl.log2(safe_z)) * 0.6931471805599453,
+                    -float("inf"))
+    tl.store(
+        O + (bh * LQ + rows[:, None].to(tl.int64)) * DV + dvs[None, :],
+        out, mask=(rows[:, None] < LQ) & (dvs[None, :] < DV),
+    )
+    tl.store(LSE + bh * LQ + rows, lse, mask=rows < LQ)
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, not bool")
+    try:
+        value = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an integer") from exc
+    if not 1 <= value <= 2**30:
+        raise ValueError(f"{name} must be in [1, 2**30]")
+    return value
+
+
+def _torch_ref_flex_attn(
+    q, k, v, window_size, chunk_size, mask_lmk, expand_to_chunk,
+    *, fp32_precision="ieee",
+):
+    """Forward equivalent of the supplied ``_torch_ref_flex_attn``.
+
+    q: (B, Lq, Hq, D), k: (B, Lk, Hkv, D), v: (B, Lk, Hkv, Dv).
+    Hq must be a positive multiple of Hkv. D/Dv may independently be 1..256.
+    Positive and zero input strides are supported; no contiguous copy is made.
+    All inputs must have the same CUDA device and dtype (fp16, bf16, fp32).
+    Target: NVIDIA Ampere or newer, a matching PyTorch/Triton installation.
+
+    For qabs = qi + (Lk-Lq), start = qabs-window_size+1; optionally
+    start = (start // chunk_size)*chunk_size (Python floor semantics).
+    Retain start <= ki <= qabs, excluding (ki+1)%chunk_size==0 if mask_lmk.
+    Scale is always 1/sqrt(D). Output shape is (B,Hq,Lq,Dv), input dtype.
+    LSE shape is (B,Hq,Lq), float32, natural log. Empty rows give 0 / -inf.
+    Lq>Lk, Lq=0, Lk=0 and B=0 are supported extensions of the reference.
+
+    ``fp32_precision='ieee'`` avoids default TF32 truncation. ``'tf32x3'``
+    is an optional faster FP32 dot mode on supported NVIDIA Triton backends.
+    This setting affects FP32 inputs only; accumulation always uses FP32.
+
+    FORWARD ONLY: raises when grad is enabled and any input requires_grad.
+    Use torch.no_grad()/inference_mode() explicitly for inference tensors.
+    Finite, normally scaled inputs are expected (no NaN/Inf/FP32 overflow).
+    """
+    window_size = _positive_int(window_size, "window_size")
+    chunk_size = _positive_int(chunk_size, "chunk_size")
+    if not isinstance(mask_lmk, bool) or not isinstance(expand_to_chunk, bool):
+        raise TypeError("mask_lmk and expand_to_chunk must be bool")
+    if fp32_precision not in ("ieee", "tf32x3"):
+        raise ValueError("fp32_precision must be 'ieee' or 'tf32x3'")
+    if not all(isinstance(t, torch.Tensor) for t in (q, k, v)):
+        raise TypeError("q, k, v must be torch tensors")
+    if any(t.ndim != 4 for t in (q, k, v)):
+        raise ValueError("q, k, v must have shape (B, L, H, D)")
+    b, lq, hq, d = q.shape
+    bk, lk, hkv, dk = k.shape
+    bv, lv, hv, dv = v.shape
+    if b != bk or b != bv or lk != lv or hkv != hv or d != dk:
+        raise ValueError("incompatible q/k/v batch, KV length, KV heads, or Q/K dimension")
+    if hq <= 0 or hkv <= 0 or hq % hkv:
+        raise ValueError("Hq must be a positive multiple of Hkv")
+    if not (1 <= d <= 256 and 1 <= dv <= 256):
+        raise ValueError("D and Dv must each be in [1, 256]")
+    if max(lq, lk) > 2**30:
+        raise ValueError("Lq and Lk must be <= 2**30")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("supported dtypes are float16, bfloat16, float32")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("q, k, v must have the same dtype")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("q, k, v must be on the same device")
+    if any(t.layout != torch.strided or any(s < 0 for s in t.stride()) for t in (q, k, v)):
+        raise ValueError("q, k, v must be strided tensors with nonnegative strides")
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        raise RuntimeError("forward only: backward is not implemented; use torch.no_grad() for inference")
+    if q.device.type != "cuda" or torch.version.hip is not None:
+        raise ValueError("this kernel requires an NVIDIA CUDA GPU")
+    if triton is None:
+        raise ImportError("Triton is required; install the Triton version matching your PyTorch build")
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
+        raise ValueError("this implementation targets NVIDIA Ampere (SM80) or newer")
+
+    out = torch.empty((b, hq, lq, dv), device=q.device, dtype=q.dtype)
+    lse = torch.empty((b, hq, lq), device=q.device, dtype=torch.float32)
+    if b == 0 or lq == 0:
+        return out, lse
+    if lk == 0 or (mask_lmk and chunk_size == 1):
+        out.zero_()
+        lse.fill_(-float("inf"))
+        return out, lse
+
+    # Conservative tiles avoid autotuning latency, and keep register/shared
+    # memory use bounded at D=256 / Dv=256. No measured performance claim.
+    if lq <= 16:
+        bm = 16
+    elif max(d, dv) > 128 or window_size < 32:
+        bm = 32
+    else:
+        bm = 64
+    bn = 32 if max(d, dv) > 128 else 64
+    bd = max(16, triton.next_power_of_2(d))
+    bdv = max(16, triton.next_power_of_2(dv))
+    stages = 1 if max(d, dv) > 128 or q.dtype == torch.float32 else 2
+    with torch.cuda.device(q.device):
+        _triton_attention_fwd[(triton.cdiv(lq, bm) * b * hq,)](
+            q, k, v, out, lse, lq, lk,
+            *q.stride(), *k.stride(), *v.stride(),
+            HQ=hq, GROUP=hq // hkv, D=d, DV=dv,
+            WINDOW=window_size, CHUNK=chunk_size,
+            MASK_LMK=mask_lmk, EXPAND=expand_to_chunk,
+            SCALE_LOG2=(1.0 / math.sqrt(d)) * math.log2(math.e),
+            FP32_PRECISION=fp32_precision, BM=bm, BN=bn, BD=bd, BDV=bdv,
+            num_warps=4, num_stages=stages,
+        )
+    return out, lse
 
 
 # ---------------------------------------------------------------------------
@@ -2073,8 +2293,10 @@ def benchmark(
     expand_to_chunk=True,
     training=True,
     q_len_inf=None,
-    warmup=10,
-    iters=50,
+    # warmup=10,
+    # iters=50,
+    warmup=1,
+    iters=1,
     skip_ref=False,
     seed=0,
 ):
@@ -2211,7 +2433,7 @@ def benchmark(
 _BENCH_CASES = [
     # ---- training: typical training shapes ----
     # ("train_2k_w512",   dict(training=True,  seq_len=2048, window_size=512,  chunk_size=64)),
-    ("train_8k_w512",   dict(training=True,  seq_len=8192, window_size=512,  chunk_size=64)),
+    ("train_8k_w512",   dict(training=False,  seq_len=8192, window_size=512,  chunk_size=64)),
     # ("train_8k_w1024",  dict(training=True,  seq_len=8192, window_size=1024, chunk_size=128)),
     # # ---- inference: prefill ----
     # ("infer_prefill_4k_q1k", dict(training=False, seq_len=4096, q_len_inf=1024, window_size=512, chunk_size=64)),
