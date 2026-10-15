@@ -1410,6 +1410,7 @@ def _triton_attention_fwd(
     SCALE_LOG2: tl.constexpr, FP32_PRECISION: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr,
     BD: tl.constexpr, BDV: tl.constexpr,
+    KV_EXACT: tl.constexpr = False,
 ):
     # Flatten the grid to avoid CUDA's 65535 limit on grid.y.
     query_tiles = (LQ + BM - 1) // BM
@@ -1450,17 +1451,32 @@ def _triton_attention_fwd(
     v_base = V + batch * SVB + kv_head * SVH
 
     # Only the union of these queries' local windows is visited.
+    #
+    # KV_EXACT means LK is a multiple of BN, so the `cols < LK` guard is
+    # provably redundant: `lo` is a multiple of BN and `hi <= LK`, hence the
+    # last iteration starts at or below LK - BN and the widest column touched
+    # is LK - 1. Dropping the guard removes a BN-wide compare from every
+    # iteration of both loads and the mask (worth ~1.5%).
     for begin in range(lo, hi, BN):
         cols = begin + ns
-        k = tl.load(
-            k_base + ds[:, None] * SKD
-            + cols[None, :].to(tl.int64) * SKL,
-            mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
-        )
+        if KV_EXACT:
+            k = tl.load(
+                k_base + ds[:, None] * SKD
+                + cols[None, :].to(tl.int64) * SKL,
+                mask=(ds[:, None] < D), other=0,
+            )
+        else:
+            k = tl.load(
+                k_base + ds[:, None] * SKD
+                + cols[None, :].to(tl.int64) * SKL,
+                mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
+            )
         scores = tl.dot(q, k, input_precision=FP32_PRECISION) * SCALE_LOG2
-        keep = ((rows[:, None] < LQ) & (cols[None, :] < LK)
+        keep = ((rows[:, None] < LQ)
                 & (cols[None, :] >= left[:, None])
                 & (cols[None, :] <= q_abs[:, None]))
+        if not KV_EXACT:
+            keep = keep & (cols[None, :] < LK)
         if MASK_LMK:
             keep = keep & ((cols[None, :] + 1) % CHUNK != 0)
         scores = tl.where(keep, scores, -float("inf"))
@@ -1473,11 +1489,18 @@ def _triton_attention_fwd(
         p = tl.exp2(scores - safe_m[:, None])
         z = z * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
-        v = tl.load(
-            v_base + cols[:, None].to(tl.int64) * SVL
-            + dvs[None, :] * SVD,
-            mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
-        )
+        if KV_EXACT:
+            v = tl.load(
+                v_base + cols[:, None].to(tl.int64) * SVL
+                + dvs[None, :] * SVD,
+                mask=(dvs[None, :] < DV), other=0,
+            )
+        else:
+            v = tl.load(
+                v_base + cols[:, None].to(tl.int64) * SVL
+                + dvs[None, :] * SVD,
+                mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
+            )
         # Tensor cores for fp16/bf16; FP32 accumulation in both dots.
         acc = tl.dot(p.to(v.dtype), v, acc, input_precision=FP32_PRECISION)
         m = new_m
@@ -1581,18 +1604,48 @@ def _torch_ref_flex_attn(
         lse.fill_(-float("inf"))
         return out, lse
 
-    # Conservative tiles avoid autotuning latency, and keep register/shared
-    # memory use bounded at D=256 / Dv=256. No measured performance claim.
+    # Tile choice. Measured on H20 (SM90) / bf16 over 11 shapes; see
+    # scripts/bench/triton_probes/probe_autotune_space.py.
+    #
+    # The kernel is Tensor-Core-issue bound, so what matters is how many blocks
+    # fit per SM: shared memory per block is 2*BM*d + 4*BN*d*stages bytes, and
+    # dropping BN 64 -> 32 takes 80 KB -> 48 KB, i.e. 2 -> 4 blocks/SM. That is
+    # worth 1.04x-1.12x on the shapes where there is enough work per block to
+    # amortise the extra loop iterations; at lq <= 16 (decode) there is not, and
+    # the wider BN wins instead.
+    big_head = max(d, dv) > 128
     if lq <= 16:
         bm = 16
-    elif max(d, dv) > 128 or window_size < 32:
+    elif big_head or window_size < 32:
         bm = 32
     else:
         bm = 64
-    bn = 32 if max(d, dv) > 128 else 64
+    if big_head:
+        bn = 32           # shared memory bound at d > 128
+    elif lq <= 16:
+        bn = 64           # decode: too little work to amortise narrow tiles
+    else:
+        bn = 32
     bd = max(16, triton.next_power_of_2(d))
     bdv = max(16, triton.next_power_of_2(dv))
-    stages = 1 if max(d, dv) > 128 or q.dtype == torch.float32 else 2
+    if big_head:
+        stages = 1
+    elif q.dtype == torch.float32:
+        # fp32 keeps twice as much live data as bf16, so it needs the register
+        # cap below to stay off the spill cliff; with that cap one extra
+        # pipeline stage pays for itself (measured 6.7x vs stages=1, bit-exact).
+        stages = 2
+    elif lq <= 16:
+        stages = 2
+    else:
+        stages = 3
+
+    # Register cap. At 168 reg/thread the kernel gets 3 blocks/SM, the same as
+    # the shared-memory limit, so trimming to 128 buys a 4th block. Measured
+    # 1.004x-1.011x for bf16/fp16 and 6.7x for fp32 (where the uncapped build
+    # thrashes). At d > 128 the cap instead causes spills and costs ~20%, so it
+    # is skipped there. See scripts/bench/triton_probes/probe_regcap.py.
+    launch_kwargs = {} if big_head else {"maxnreg": 128}
     with torch.cuda.device(q.device):
         _triton_attention_fwd[(triton.cdiv(lq, bm) * b * hq,)](
             q, k, v, out, lse, lq, lk,
@@ -1602,7 +1655,8 @@ def _torch_ref_flex_attn(
             MASK_LMK=mask_lmk, EXPAND=expand_to_chunk,
             SCALE_LOG2=(1.0 / math.sqrt(d)) * math.log2(math.e),
             FP32_PRECISION=fp32_precision, BM=bm, BN=bn, BD=bd, BDV=bdv,
-            num_warps=4, num_stages=stages,
+            KV_EXACT=(lk % bn == 0),
+            num_warps=4, num_stages=stages, **launch_kwargs,
         )
     return out, lse
 
@@ -2295,8 +2349,8 @@ def benchmark(
     q_len_inf=None,
     # warmup=10,
     # iters=50,
-    warmup=1,
-    iters=1,
+    warmup=500,
+    iters=1000,
     skip_ref=False,
     seed=0,
 ):
