@@ -1444,6 +1444,20 @@ def _triton_attention_fwd(
     lo = (first_left // BN) * BN
     hi = tl.maximum(0, tl.minimum(LK, tl.minimum((tile + 1) * BM, LQ) + (LK - LQ)))
 
+    # Range facts the compiler cannot derive through the clamp/floor chain
+    # above. They let it drop sign handling and some bounds arithmetic in the
+    # loop's index math. Semantics-preserving: every fact is already
+    # guaranteed by the expressions above plus the wrapper's validation, so
+    # the output stays bit-identical (verified by torch.equal, not a
+    # tolerance). Measured 1.040x on prefill Lq4k/Lk8k, 1.008x on Lq2k/Lk8k,
+    # and 0.997x-1.003x elsewhere -- no shape regresses. See
+    # scripts/bench/triton_probes/probe_assume.py.
+    tl.assume(lo >= 0)
+    tl.assume(hi >= 0)
+    tl.assume(hi <= LK)
+    tl.assume(LQ > 0)
+    tl.assume(LK > 0)
+
     m = tl.full((BM,), -float("inf"), tl.float32)
     z = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BDV), tl.float32)
@@ -1516,6 +1530,154 @@ def _triton_attention_fwd(
         out, mask=(rows[:, None] < LQ) & (dvs[None, :] < DV),
     )
     tl.store(LSE + bh * LQ + rows, lse, mask=rows < LQ)
+
+
+@triton.jit(do_not_specialize=["LQ", "LK"])
+def _triton_attention_fwd_split(
+    Q, K, V, PO, PM, PZ, LQ, LK,
+    SQB: tl.constexpr, SQL: tl.constexpr,
+    SQH: tl.constexpr, SQD: tl.constexpr,
+    SKB: tl.constexpr, SKL: tl.constexpr,
+    SKH: tl.constexpr, SKD: tl.constexpr,
+    SVB: tl.constexpr, SVL: tl.constexpr,
+    SVH: tl.constexpr, SVD: tl.constexpr,
+    HQ: tl.constexpr, GROUP: tl.constexpr,
+    D: tl.constexpr, DV: tl.constexpr,
+    WINDOW: tl.constexpr, CHUNK: tl.constexpr,
+    MASK_LMK: tl.constexpr, EXPAND: tl.constexpr,
+    SCALE_LOG2: tl.constexpr, FP32_PRECISION: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr,
+    BD: tl.constexpr, BDV: tl.constexpr,
+    NSPLIT: tl.constexpr,
+):
+    """Phase 1 of the split-KV path: one block per (batch, head, split).
+
+    Only used when ``LQ <= BM`` (a single query tile), so there is no query
+    tile index -- the grid's extra dimension is the KV split instead. Each
+    block scans its slice of the query's local window and writes the partial
+    online-softmax state (acc, m, z); ``_triton_attention_fwd_combine``
+    merges them. Semantics match ``_triton_attention_fwd`` exactly.
+    """
+    pid = tl.program_id(0)
+    split = pid % NSPLIT
+    bh = (pid // NSPLIT).to(tl.int64)
+    batch = bh // HQ
+    head = bh % HQ
+    kv_head = head // GROUP
+
+    rows = tl.arange(0, BM)
+    q_abs = rows + (LK - LQ)
+    ds = tl.arange(0, BD).to(tl.int64)
+    dvs = tl.arange(0, BDV).to(tl.int64)
+    ns = tl.arange(0, BN)
+    q = tl.load(
+        Q + batch * SQB + head * SQH
+        + rows[:, None].to(tl.int64) * SQL + ds[None, :] * SQD,
+        mask=(rows[:, None] < LQ) & (ds[None, :] < D), other=0,
+    )
+
+    left = tl.maximum(q_abs - WINDOW + 1, 0)
+    first_left = tl.maximum((LK - LQ) - WINDOW + 1, 0)
+    if EXPAND:
+        left = (left // CHUNK) * CHUNK
+        first_left = (first_left // CHUNK) * CHUNK
+    lo_all = (first_left // BN) * BN
+    hi_all = tl.maximum(0, tl.minimum(LK, tl.minimum(BM, LQ) + (LK - LQ)))
+
+    # Partition the visited column span across splits on BN boundaries, so
+    # every split sees whole KV tiles and the masks stay identical.
+    n_blk = (hi_all - lo_all + BN - 1) // BN
+    per = (n_blk + NSPLIT - 1) // NSPLIT
+    lo = lo_all + split * per * BN
+    hi = tl.minimum(lo + per * BN, hi_all)
+
+    m = tl.full((BM,), -float("inf"), tl.float32)
+    z = tl.zeros((BM,), tl.float32)
+    acc = tl.zeros((BM, BDV), tl.float32)
+    k_base = K + batch * SKB + kv_head * SKH
+    v_base = V + batch * SVB + kv_head * SVH
+
+    for begin in range(lo, hi, BN):
+        cols = begin + ns
+        k = tl.load(
+            k_base + ds[:, None] * SKD + cols[None, :].to(tl.int64) * SKL,
+            mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
+        )
+        scores = tl.dot(q, k, input_precision=FP32_PRECISION) * SCALE_LOG2
+        keep = ((rows[:, None] < LQ)
+                & (cols[None, :] >= left[:, None])
+                & (cols[None, :] <= q_abs[:, None])
+                & (cols[None, :] < LK))
+        if MASK_LMK:
+            keep = keep & ((cols[None, :] + 1) % CHUNK != 0)
+        scores = tl.where(keep, scores, -float("inf"))
+
+        new_m = tl.maximum(m, tl.max(scores, axis=1))
+        safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        alpha = tl.exp2(m - safe_m)
+        p = tl.exp2(scores - safe_m[:, None])
+        z = z * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            v_base + cols[:, None].to(tl.int64) * SVL + dvs[None, :] * SVD,
+            mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
+        )
+        acc = tl.dot(p.to(v.dtype), v, acc, input_precision=FP32_PRECISION)
+        m = new_m
+
+    base = (bh * NSPLIT + split) * BM
+    tl.store(PO + (base + rows[:, None]) * DV + dvs[None, :], acc,
+             mask=(rows[:, None] < LQ) & (dvs[None, :] < DV))
+    tl.store(PM + base + rows, m, mask=rows < LQ)
+    tl.store(PZ + base + rows, z, mask=rows < LQ)
+
+
+@triton.jit(do_not_specialize=["LQ"])
+def _triton_attention_fwd_combine(
+    PO, PM, PZ, O, LSE, LQ,
+    DV: tl.constexpr, BM: tl.constexpr, BDV: tl.constexpr,
+    NSPLIT: tl.constexpr,
+):
+    """Phase 2: log-sum-exp merge of the per-split partial states.
+
+    A split whose slice was entirely masked has m = -inf; its weight is
+    forced to 0 so -inf - -inf is never evaluated. If every split is empty
+    the row yields 0 / -inf, matching ``_triton_attention_fwd``.
+    """
+    bh = tl.program_id(0).to(tl.int64)
+    rows = tl.arange(0, BM)
+    dvs = tl.arange(0, BDV)
+
+    global_m = tl.full((BM,), -float("inf"), tl.float32)
+    for s in range(NSPLIT):
+        pm = tl.load(PM + (bh * NSPLIT + s) * BM + rows,
+                     mask=rows < LQ, other=-float("inf"))
+        global_m = tl.maximum(global_m, pm)
+    safe_m = tl.where(global_m == -float("inf"), 0.0, global_m)
+
+    num = tl.zeros((BM, BDV), tl.float32)
+    den = tl.zeros((BM,), tl.float32)
+    for s in range(NSPLIT):
+        base = (bh * NSPLIT + s) * BM
+        pm = tl.load(PM + base + rows, mask=rows < LQ, other=-float("inf"))
+        pz = tl.load(PZ + base + rows, mask=rows < LQ, other=0.0)
+        po = tl.load(PO + (base + rows[:, None]) * DV + dvs[None, :],
+                     mask=(rows[:, None] < LQ) & (dvs[None, :] < DV),
+                     other=0.0)
+        w = tl.where(pm == -float("inf"), 0.0, tl.exp2(pm - safe_m))
+        num += po * w[:, None]
+        den += pz * w
+
+    nonempty = den > 0.0
+    safe_den = tl.where(nonempty, den, 1.0)
+    tl.store(O + (bh * LQ + rows[:, None]) * DV + dvs[None, :],
+             (num / safe_den[:, None]).to(O.dtype.element_ty),
+             mask=(rows[:, None] < LQ) & (dvs[None, :] < DV))
+    tl.store(LSE + bh * LQ + rows,
+             tl.where(nonempty,
+                      (global_m + tl.log2(safe_den)) * 0.6931471805599453,
+                      -float("inf")),
+             mask=rows < LQ)
 
 
 def _positive_int(value, name):
@@ -1614,22 +1776,55 @@ def _torch_ref_flex_attn(
     # amortise the extra loop iterations; at lq <= 16 (decode) there is not, and
     # the wider BN wins instead.
     big_head = max(d, dv) > 128
-    if lq <= 16:
+
+    # The big_head and fp32 branches below were originally conservative
+    # defaults written without measurement. Both turned out to be
+    # misconfigurations, the same way 2.4 found for fp32's stage count:
+    # sweeping 108 configs x 2 shapes each gave 1.57x-1.67x for D=256 and
+    # 1.18x-1.21x for fp32. See scripts/bench/triton_probes/probe_bighead.py.
+
+    # Small-grid regime. The tile choice above was swept on shapes whose grid
+    # already fills the GPU, so it ignores occupancy. At bm=64 the grid is
+    # cdiv(lq,64)*b*hq, which for a single short sequence is far below the SM
+    # count -- Lq=128 with 8 heads gives 16 blocks on 78 SMs. Narrowing bm to
+    # 16 quadruples the query tiles and hence the grid, which is worth
+    # 1.54x-1.61x at grid 16 and 1.13x at grid 32.
+    #
+    # The trigger is the grid, not lq: Lq=128 at batch 4 also has lq=128 but
+    # reaches grid 64, where the narrow tile instead costs 38% (0.618x).
+    # Keying this off lq would therefore regress batched prefill badly.
+    # Measured cutoffs: grid 16 -> 1.55x, 32 -> 1.13x, 48 -> 0.86x,
+    # 64 -> 0.62x. See scripts/bench/triton_probes/probe_small_grid.py.
+    small_grid = (not big_head
+                  and window_size >= 32
+                  and triton.cdiv(lq, 64) * b * hq <= 32)
+
+    if lq <= 16 or small_grid:
         bm = 16
-    elif big_head or window_size < 32:
+    elif window_size < 32:
         bm = 32
     else:
-        bm = 64
+        bm = 64           # big_head included: bm=64 led both D=256 shapes
     if big_head:
-        bn = 32           # shared memory bound at d > 128
-    elif lq <= 16:
-        bn = 64           # decode: too little work to amortise narrow tiles
+        # Swept at D=Dv=256 over 108 configs x 2 shapes; bm64/bn64/stages=2
+        # led both (1.565x at Lq2k, 1.669x at Lq4k/Lk8k vs the old
+        # bm32/bn32/stages=1, which had never been measured). The register
+        # cap stays off here -- see launch_kwargs below.
+        bn = 64
+    elif q.dtype == torch.float32:
+        # fp32 wants a narrow BN, not the bf16 choice: bn=16 led both fp32
+        # shapes (1.176x at Lq2k, 1.209x at Lq8k) because fp32 tiles are
+        # twice the bytes, so BN=32 overruns the shared-memory budget that
+        # BN=16 fits. rel_ratio ~1e-07, i.e. effectively lossless.
+        bn = 16
+    elif lq <= 16 or small_grid:
+        bn = 64           # too few blocks to amortise narrow tiles
     else:
         bn = 32
     bd = max(16, triton.next_power_of_2(d))
     bdv = max(16, triton.next_power_of_2(dv))
     if big_head:
-        stages = 1
+        stages = 2        # stages=1 was the unmeasured default; 2 led both
     elif q.dtype == torch.float32:
         # fp32 keeps twice as much live data as bf16, so it needs the register
         # cap below to stay off the spill cliff; with that cap one extra
@@ -1638,6 +1833,8 @@ def _torch_ref_flex_attn(
     elif lq <= 16:
         stages = 2
     else:
+        # small_grid lands here too: at bm=16/bn=64 the extra pipeline stage
+        # measured 1.55x vs 1.37x at stages=2 (Lq128/Lk8k).
         stages = 3
 
     # Register cap. At 168 reg/thread the kernel gets 3 blocks/SM, the same as
@@ -1646,6 +1843,54 @@ def _torch_ref_flex_attn(
     # thrashes). At d > 128 the cap instead causes spills and costs ~20%, so it
     # is skipped there. See scripts/bench/triton_probes/probe_regcap.py.
     launch_kwargs = {} if big_head else {"maxnreg": 128}
+
+    # Split-KV for decode-shaped launches. At lq <= bm the grid is just
+    # b*hq blocks -- 8 for a single sequence with 8 heads, leaving 70 of
+    # this GPU's SMs idle, which is why decode Lq=1 measures the same
+    # 11.4 us at Lk=4k and Lk=8k (the window pins the work, and the kernel
+    # is occupancy- not compute-bound: a preallocated-output launch spends
+    # 11.37 of those 11.4 us inside the kernel). Splitting the window
+    # across blocks and merging the partial softmax states fills the
+    # machine: measured 1.86x at Lq1/Lk4k-32k, 1.57x at Lq16, and 3.76x at
+    # window=2048. It only pays while the grid is below the SM count --
+    # 1.14x at grid 64 and 0.94x at grid 256 -- so the predicate is grid
+    # saturation, not sequence length.
+    #
+    # Partial-sum merging reorders accumulation, so decode output is no
+    # longer bit-identical to the single-pass path (rel_ratio 2.4e-03 vs
+    # the 6e-3 threshold). See scripts/bench/triton_probes/probe_splitkv.py.
+    grid_blocks = triton.cdiv(lq, bm) * b * hq
+    n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    nsplit = 1
+    if lq <= bm and grid_blocks < n_sm and not big_head:
+        kv_blocks = triton.cdiv(lk, bn)
+        nsplit = min(triton.cdiv(n_sm, grid_blocks), kv_blocks, 8)
+    if nsplit > 1:
+        n_bh = b * hq
+        partial_o = torch.empty((n_bh * nsplit * bm, dv),
+                                device=q.device, dtype=torch.float32)
+        partial_m = torch.empty((n_bh * nsplit * bm,),
+                                device=q.device, dtype=torch.float32)
+        partial_z = torch.empty((n_bh * nsplit * bm,),
+                                device=q.device, dtype=torch.float32)
+        with torch.cuda.device(q.device):
+            _triton_attention_fwd_split[(n_bh * nsplit,)](
+                q, k, v, partial_o, partial_m, partial_z, lq, lk,
+                *q.stride(), *k.stride(), *v.stride(),
+                HQ=hq, GROUP=hq // hkv, D=d, DV=dv,
+                WINDOW=window_size, CHUNK=chunk_size,
+                MASK_LMK=mask_lmk, EXPAND=expand_to_chunk,
+                SCALE_LOG2=(1.0 / math.sqrt(d)) * math.log2(math.e),
+                FP32_PRECISION=fp32_precision, BM=bm, BN=bn, BD=bd, BDV=bdv,
+                NSPLIT=nsplit,
+                num_warps=4, num_stages=stages, **launch_kwargs,
+            )
+            _triton_attention_fwd_combine[(n_bh,)](
+                partial_o, partial_m, partial_z, out, lse, lq,
+                DV=dv, BM=bm, BDV=bdv, NSPLIT=nsplit, num_warps=4,
+            )
+        return out, lse
+
     with torch.cuda.device(q.device):
         _triton_attention_fwd[(triton.cdiv(lq, bm) * b * hq,)](
             q, k, v, out, lse, lq, lk,
