@@ -1464,6 +1464,9 @@ def _triton_attention_fwd(
     k_base = K + batch * SKB + kv_head * SKH
     v_base = V + batch * SVB + kv_head * SVH
 
+    # Pre-compute loop-invariant row mask (BM vector, independent of cols).
+    row_valid = rows < LQ
+
     # Only the union of these queries' local windows is visited.
     #
     # KV_EXACT means LK is a multiple of BN, so the `cols < LK` guard is
@@ -1486,7 +1489,7 @@ def _triton_attention_fwd(
                 mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
             )
         scores = tl.dot(q, k, input_precision=FP32_PRECISION) * SCALE_LOG2
-        keep = ((rows[:, None] < LQ)
+        keep = (row_valid[:, None]
                 & (cols[None, :] >= left[:, None])
                 & (cols[None, :] <= q_abs[:, None]))
         if not KV_EXACT:
@@ -1549,6 +1552,7 @@ def _triton_attention_fwd_split(
     BM: tl.constexpr, BN: tl.constexpr,
     BD: tl.constexpr, BDV: tl.constexpr,
     NSPLIT: tl.constexpr,
+    KV_EXACT: tl.constexpr = False,
 ):
     """Phase 1 of the split-KV path: one block per (batch, head, split).
 
@@ -1591,6 +1595,13 @@ def _triton_attention_fwd_split(
     lo = lo_all + split * per * BN
     hi = tl.minimum(lo + per * BN, hi_all)
 
+    # Range facts (mirroring the main kernel).
+    tl.assume(lo >= 0)
+    tl.assume(hi >= 0)
+    tl.assume(hi <= LK)
+    tl.assume(LQ > 0)
+    tl.assume(LK > 0)
+
     m = tl.full((BM,), -float("inf"), tl.float32)
     z = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BDV), tl.float32)
@@ -1599,15 +1610,22 @@ def _triton_attention_fwd_split(
 
     for begin in range(lo, hi, BN):
         cols = begin + ns
-        k = tl.load(
-            k_base + ds[:, None] * SKD + cols[None, :].to(tl.int64) * SKL,
-            mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
-        )
+        if KV_EXACT:
+            k = tl.load(
+                k_base + ds[:, None] * SKD + cols[None, :].to(tl.int64) * SKL,
+                mask=(ds[:, None] < D), other=0,
+            )
+        else:
+            k = tl.load(
+                k_base + ds[:, None] * SKD + cols[None, :].to(tl.int64) * SKL,
+                mask=(ds[:, None] < D) & (cols[None, :] < LK), other=0,
+            )
         scores = tl.dot(q, k, input_precision=FP32_PRECISION) * SCALE_LOG2
         keep = ((rows[:, None] < LQ)
                 & (cols[None, :] >= left[:, None])
-                & (cols[None, :] <= q_abs[:, None])
-                & (cols[None, :] < LK))
+                & (cols[None, :] <= q_abs[:, None]))
+        if not KV_EXACT:
+            keep = keep & (cols[None, :] < LK)
         if MASK_LMK:
             keep = keep & ((cols[None, :] + 1) % CHUNK != 0)
         scores = tl.where(keep, scores, -float("inf"))
@@ -1618,10 +1636,16 @@ def _triton_attention_fwd_split(
         p = tl.exp2(scores - safe_m[:, None])
         z = z * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
-        v = tl.load(
-            v_base + cols[:, None].to(tl.int64) * SVL + dvs[None, :] * SVD,
-            mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
-        )
+        if KV_EXACT:
+            v = tl.load(
+                v_base + cols[:, None].to(tl.int64) * SVL + dvs[None, :] * SVD,
+                mask=(dvs[None, :] < DV), other=0,
+            )
+        else:
+            v = tl.load(
+                v_base + cols[:, None].to(tl.int64) * SVL + dvs[None, :] * SVD,
+                mask=(cols[:, None] < LK) & (dvs[None, :] < DV), other=0,
+            )
         acc = tl.dot(p.to(v.dtype), v, acc, input_precision=FP32_PRECISION)
         m = new_m
 
@@ -1640,23 +1664,21 @@ def _triton_attention_fwd_combine(
 ):
     """Phase 2: log-sum-exp merge of the per-split partial states.
 
-    A split whose slice was entirely masked has m = -inf; its weight is
-    forced to 0 so -inf - -inf is never evaluated. If every split is empty
-    the row yields 0 / -inf, matching ``_triton_attention_fwd``.
+    Single-pass online merge (same rescaling as the main kernel's inner loop):
+    reads each split's (acc, m, z) exactly once, halving global memory traffic
+    compared to the two-pass version. A split whose slice was entirely masked
+    has m = -inf; its weight is forced to 0 so -inf - -inf is never evaluated.
+    If every split is empty the row yields 0 / -inf, matching the main kernel.
     """
     bh = tl.program_id(0).to(tl.int64)
     rows = tl.arange(0, BM)
     dvs = tl.arange(0, BDV)
 
-    global_m = tl.full((BM,), -float("inf"), tl.float32)
-    for s in range(NSPLIT):
-        pm = tl.load(PM + (bh * NSPLIT + s) * BM + rows,
-                     mask=rows < LQ, other=-float("inf"))
-        global_m = tl.maximum(global_m, pm)
-    safe_m = tl.where(global_m == -float("inf"), 0.0, global_m)
+    # Online merge: acc, m, z are updated incrementally per split.
+    cur_m = tl.full((BM,), -float("inf"), tl.float32)
+    cur_z = tl.zeros((BM,), tl.float32)
+    cur_acc = tl.zeros((BM, BDV), tl.float32)
 
-    num = tl.zeros((BM, BDV), tl.float32)
-    den = tl.zeros((BM,), tl.float32)
     for s in range(NSPLIT):
         base = (bh * NSPLIT + s) * BM
         pm = tl.load(PM + base + rows, mask=rows < LQ, other=-float("inf"))
@@ -1664,18 +1686,24 @@ def _triton_attention_fwd_combine(
         po = tl.load(PO + (base + rows[:, None]) * DV + dvs[None, :],
                      mask=(rows[:, None] < LQ) & (dvs[None, :] < DV),
                      other=0.0)
-        w = tl.where(pm == -float("inf"), 0.0, tl.exp2(pm - safe_m))
-        num += po * w[:, None]
-        den += pz * w
+        new_m = tl.maximum(cur_m, pm)
+        # Guard -inf - -inf: if new_m is -inf, both sides are empty,
+        # alpha = beta = 0 keeps everything zero.
+        safe_new_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+        alpha = tl.where(cur_m == -float("inf"), 0.0, tl.exp2(cur_m - safe_new_m))
+        beta = tl.where(pm == -float("inf"), 0.0, tl.exp2(pm - safe_new_m))
+        cur_z = cur_z * alpha + pz * beta
+        cur_acc = cur_acc * alpha[:, None] + po * beta[:, None]
+        cur_m = new_m
 
-    nonempty = den > 0.0
-    safe_den = tl.where(nonempty, den, 1.0)
+    nonempty = cur_z > 0.0
+    safe_den = tl.where(nonempty, cur_z, 1.0)
     tl.store(O + (bh * LQ + rows[:, None]) * DV + dvs[None, :],
-             (num / safe_den[:, None]).to(O.dtype.element_ty),
+             (cur_acc / safe_den[:, None]).to(O.dtype.element_ty),
              mask=(rows[:, None] < LQ) & (dvs[None, :] < DV))
     tl.store(LSE + bh * LQ + rows,
              tl.where(nonempty,
-                      (global_m + tl.log2(safe_den)) * 0.6931471805599453,
+                      (cur_m + tl.log2(safe_den)) * 0.6931471805599453,
                       -float("inf")),
              mask=rows < LQ)
 
@@ -1883,6 +1911,7 @@ def _torch_ref_flex_attn(
                 SCALE_LOG2=(1.0 / math.sqrt(d)) * math.log2(math.e),
                 FP32_PRECISION=fp32_precision, BM=bm, BN=bn, BD=bd, BDV=bdv,
                 NSPLIT=nsplit,
+                KV_EXACT=(lk % bn == 0),
                 num_warps=4, num_stages=stages, **launch_kwargs,
             )
             _triton_attention_fwd_combine[(n_bh,)](
